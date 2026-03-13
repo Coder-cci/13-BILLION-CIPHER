@@ -478,7 +478,9 @@ class RetroCipherApp:
 
     def scan_cipher_alphabets(self):
         try:
-            files = [f for f in os.listdir('.') if f.endswith('.txt')]
+            # Путь к папке alphabet (без 's')
+            alphabet_folder = os.path.join(os.path.dirname(__file__), "alphabets")
+            files = [f for f in os.listdir(alphabet_folder) if f.endswith('.txt')]
             return files if files else ['alphabet1660.txt']
         except:
             return ['alphabet1660.txt']
@@ -486,7 +488,9 @@ class RetroCipherApp:
     def load_cipher_alphabet(self):
         filename = self.cipher_alphabet_combo.get()
         if filename:
-            self.current_cipher_alphabet = CipherAlphabet(filename)
+            alphabet_folder = os.path.join(os.path.dirname(__file__), "alphabets")
+            full_path = os.path.join(alphabet_folder, filename)
+            self.current_cipher_alphabet = CipherAlphabet(full_path)
             info = f"{len(self.current_cipher_alphabet)} characters"
             self.cipher_alphabet_info.config(text=info)
             self.cipher_size_label.config(text=str(len(self.current_cipher_alphabet)))
