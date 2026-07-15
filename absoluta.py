@@ -1,6 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox, filedialog
 import hashlib
+import hmac
 import os
 import secrets
 import re
@@ -217,17 +218,17 @@ class RetroCipherApp:
         self.weight_mid.bind('<KeyRelease>', self.on_param_change)
         self.weight_right.bind('<KeyRelease>', self.on_param_change)
         self.cipher_alphabet_combo.bind('<<ComboboxSelected>>', self.on_cipher_alphabet_change)
-    
+
     def generate_random_params(self):
         seed = secrets.token_hex(16).upper()
         self.seed_entry.delete(0, tk.END)
         self.seed_entry.insert(0, seed)
 
-        salt_prob = str(random.randint(0, 999)).zfill(3)
+        salt_prob = str(secrets.randbelow(1000)).zfill(3)
         self.salt_prob_entry.delete(0, tk.END)
         self.salt_prob_entry.insert(0, salt_prob)
 
-        weights = ''.join([str(random.randint(0, 3)) for _ in range(3)])
+        weights = ''.join([str(secrets.randbelow(4)) for _ in range(3)])
         self.weight_left.delete(0, tk.END)
         self.weight_left.insert(0, weights[0])
         self.weight_mid.delete(0, tk.END)
@@ -561,9 +562,10 @@ class RetroCipherApp:
         salt_prob = self.salt_prob_entry.get().zfill(3)[:3]
         weights = (self.weight_left.get() + self.weight_mid.get() + self.weight_right.get())[:3]
 
-        filename = self.cipher_alphabet_combo.get()
-        numbers = re.findall(r'\d+', filename)
-        alphabet_number = numbers[0] if numbers else "0"
+        if self.current_cipher_alphabet:
+            alphabet_number = str(len(self.current_cipher_alphabet))
+        else:
+            alphabet_number = "0"
 
         key = f"{seed}-{salt_prob}-{weights}-{alphabet_number}"
         self.key_display.delete(0, tk.END)
@@ -594,13 +596,6 @@ class RetroCipherApp:
                 if rng.get_int(100) < probs[i]:
                     return i
 
-    def generate_mask(self, seed, length):
-        rng = CSPRNG(seed + "_MASK")
-        mask = []
-        for _ in range(length):
-            mask.append(rng.get_int(len(self.current_cipher_alphabet)))
-        return mask
-
     def run(self):
         valid, msg = self.validate_params()
         if not valid:
@@ -625,7 +620,8 @@ class RetroCipherApp:
         if not key_params:
             return
 
-        rng = CSPRNG(key_params['seed'])
+        rng_cipher = CSPRNG(key_params['seed'] + "_CIPHER")
+        rng_mask = CSPRNG(key_params['seed'] + "_MASK")
 
         text = self.input_text.get(1.0, tk.END).rstrip('\n')
         if not text:
@@ -644,12 +640,12 @@ class RetroCipherApp:
         for char in text:
             char_index = source_alphabet.index(char)
             x = char_index
-            y = rng.get_int(cipher_size)
-            has_salt = rng.get_int(1000) < (key_params['salt_prob'] * 1000)
+            y = rng_cipher.get_int(cipher_size)
+            has_salt = rng_cipher.get_int(1000) < (key_params['salt_prob'] * 1000)
 
             if has_salt:
-                salt_pos = self.choose_salt_position(rng, key_params['weights'])
-                salt = rng.get_int(cipher_size)
+                salt_pos = self.choose_salt_position(rng_cipher, key_params['weights'])
+                salt = rng_cipher.get_int(cipher_size)
 
                 if salt_pos == 0:
                     triplet = [salt, x, y]
@@ -667,7 +663,9 @@ class RetroCipherApp:
 
         intermediate = ''.join(ciphertext)
 
-        mask = self.generate_mask(key_params['seed'], len(intermediate))
+        mask = []
+        for _ in range(len(intermediate)):
+            mask.append(rng_mask.get_int(cipher_size))
 
         final_chars = []
         for i, char in enumerate(intermediate):
@@ -679,12 +677,17 @@ class RetroCipherApp:
                 final_chars.append(char)
 
         result = ''.join(final_chars)
+
+        # Вычисляем HMAC и добавляем к результату
+        hmac_value = self.compute_hmac(key_params['seed'], result)
+        result_with_hmac = result + "|" + hmac_value
+
         self.output_text.delete(1.0, tk.END)
-        self.output_text.insert(tk.END, result)
+        self.output_text.insert(tk.END, result_with_hmac)
 
         self.src_len_label.config(text=str(len(text)))
-        self.res_len_label.config(text=str(len(result)))
-        self.status.config(text=f"Encrypted {len(text)} → {len(result)} characters (with XOR)")
+        self.res_len_label.config(text=str(len(result_with_hmac)))
+        self.status.config(text=f"Encrypted {len(text)} → {len(result_with_hmac)} characters (with HMAC)")
 
     def decrypt(self):
         if not self.current_cipher_alphabet:
@@ -699,15 +702,40 @@ class RetroCipherApp:
         if not key_params:
             return
 
-        ciphertext = self.input_text.get(1.0, tk.END).rstrip('\n')
-        if not ciphertext:
+        ciphertext_with_hmac = self.input_text.get(1.0, tk.END).rstrip('\n')
+        if not ciphertext_with_hmac:
             messagebox.showwarning("Warning", "No text to decrypt")
             return
 
+        # 1. ОТДЕЛЯЕМ HMAC ОТ ШИФРОТЕКСТА
+        if '|' not in ciphertext_with_hmac:
+            messagebox.showerror("Error", "Invalid ciphertext format (no HMAC found)")
+            return
+
+        parts = ciphertext_with_hmac.rsplit('|', 1)
+        if len(parts) != 2:
+            messagebox.showerror("Error", "Invalid ciphertext format")
+            return
+
+        ciphertext, received_hmac = parts[0], parts[1]
+
+        # 2. ПРОВЕРЯЕМ HMAC
+        expected_hmac = self.compute_hmac(key_params['seed'], ciphertext)
+        if not hmac.compare_digest(received_hmac, expected_hmac):
+            messagebox.showerror("Error", "HMAC verification failed! Ciphertext has been tampered with.")
+            return
+
+        # 3. РАСШИФРОВКА (только после успешной проверки HMAC)
         chars = list(ciphertext)
         total_chars = len(chars)
+        cipher_size = len(self.current_cipher_alphabet)
 
-        mask = self.generate_mask(key_params['seed'], total_chars)
+        rng_cipher = CSPRNG(key_params['seed'] + "_CIPHER")
+        rng_mask = CSPRNG(key_params['seed'] + "_MASK")
+
+        mask = []
+        for _ in range(total_chars):
+            mask.append(rng_mask.get_int(cipher_size))
 
         unmasked_chars = []
         for i, char in enumerate(chars):
@@ -718,19 +746,16 @@ class RetroCipherApp:
             else:
                 unmasked_chars.append(char)
 
-        rng = CSPRNG(key_params['seed'])
-
         plaintext = []
         pos = 0
-        cipher_size = len(self.current_cipher_alphabet)
 
         while pos < total_chars:
-            y = rng.get_int(cipher_size)
-            has_salt = rng.get_int(1000) < (key_params['salt_prob'] * 1000)
+            y = rng_cipher.get_int(cipher_size)
+            has_salt = rng_cipher.get_int(1000) < (key_params['salt_prob'] * 1000)
 
             if has_salt:
-                salt_pos = self.choose_salt_position(rng, key_params['weights'])
-                salt = rng.get_int(cipher_size)
+                salt_pos = self.choose_salt_position(rng_cipher, key_params['weights'])
+                salt = rng_cipher.get_int(cipher_size)
 
                 if pos + 2 >= total_chars:
                     break
@@ -741,21 +766,33 @@ class RetroCipherApp:
                         break
                     char_x = unmasked_chars[pos]
                     x_index = self.current_cipher_alphabet.get_index(char_x)
-                    pos += 2
+                    pos += 1
+                    if pos >= total_chars:
+                        break
+                    pos += 1
 
                 elif salt_pos == 1:
                     if pos >= total_chars:
                         break
                     char_x = unmasked_chars[pos]
                     x_index = self.current_cipher_alphabet.get_index(char_x)
-                    pos += 3
+                    pos += 1
+                    pos += 1
+                    if pos >= total_chars:
+                        break
+                    pos += 1
 
                 else:
                     if pos >= total_chars:
                         break
                     char_x = unmasked_chars[pos]
                     x_index = self.current_cipher_alphabet.get_index(char_x)
-                    pos += 3
+                    pos += 1
+                    if pos >= total_chars:
+                        break
+                    pos += 1
+                    pos += 1
+
             else:
                 if pos + 1 >= total_chars:
                     break
@@ -764,7 +801,8 @@ class RetroCipherApp:
                     break
                 char_x = unmasked_chars[pos]
                 x_index = self.current_cipher_alphabet.get_index(char_x)
-                pos += 2
+                pos += 1
+                pos += 1
 
             if x_index != -1 and 0 <= x_index < len(source_alphabet):
                 plaintext.append(source_alphabet[x_index])
@@ -777,7 +815,7 @@ class RetroCipherApp:
 
         self.src_len_label.config(text=str(total_chars))
         self.res_len_label.config(text=str(len(plaintext)))
-        self.status.config(text=f"Decrypted {len(plaintext)} characters out of {total_chars} (with XOR)")
+        self.status.config(text=f"Decrypted {len(plaintext)} characters out of {total_chars} (HMAC verified)")
 
     def clear_all(self):
         self.input_text.delete(1.0, tk.END)
@@ -815,6 +853,8 @@ class RetroCipherApp:
                             "Absoluta\n"
                             "Version 0.1.0")
 
+    def compute_hmac(self, key, data):
+        return hmac.new(key.encode('utf-8'), data.encode('utf-8'), hashlib.sha256).hexdigest()
 
 if __name__ == "__main__":
     root = tk.Tk()
